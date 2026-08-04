@@ -98,23 +98,17 @@ app.post('/bulk', async (req, res) => {
 
           console.log(`[${new Date().toISOString()}] ${cardNumber} - ${status}`);
 
-          // Considera DECLINED/REPROVADA/Suspected fraud/etc como declínio para reteste
-          const isDeclined = status && (
-            status === 'DECLINED' ||
-            status.includes('DECLINED') ||
-            status.includes('REPROVADA') ||
-            status.includes('fraud') ||
-            status.includes('Fraud')
-          );
+          // Só APPROVED finaliza sem reteste. Qualquer outro status (DECLINED, REPROVADA, fraud, ERROR, etc) retesta 2x na mesma aba
+          const isApproved = status === 'APPROVED';
 
-          if (isTimeout || status === 'APPROVED') {
+          if (isTimeout || isApproved) {
             if (currentBrowser) {
               try { await currentBrowser.close(); } catch (e) {}
               currentBrowser = null;
               currentPage = null;
             }
-          } else if (isDeclined || status === 'ERROR') {
-            // Retesta os próximos 2 cards na mesma aba
+          } else {
+            // Retesta os próximos 2 cards na mesma aba (qualquer status != APPROVED)
             for (let r = 0; r < 2; r++) {
               const retestIdx = nextCardIndex++;
               if (retestIdx >= lines.length) break;
@@ -139,6 +133,7 @@ app.post('/bulk', async (req, res) => {
 
               results.push({ cardNumber: rc, expiryMonth: rm, expiryYear: ry, cvv: rcv, status: retestResult ? retestResult.status : 'ERROR', errorReason: retestResult ? retestResult.errorReason : null, duration: 'reteste' });
 
+              // Se algum reteste der APPROVED, para
               if (retestResult && retestResult.status === 'APPROVED') break;
             }
 
