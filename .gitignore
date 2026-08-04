@@ -1,0 +1,24 @@
+# Dependências (reinstalar com: npm install)
+node_modules/
+
+# Dados sensíveis (cartões de teste e aprovados)
+card.txt
+approved.txt
+
+# Logs temporários
+logs.txt
+
+# Backups manuais
+backup_*/
+
+# Arquivos de teste/backup antigos
+backup.js
+backup2.js
+xd.js
+
+# Sistema
+.DS_Store
+Thumbs.db
+
+# Perfis Chrome (gerados em runtime)
+chrome-profile*/
