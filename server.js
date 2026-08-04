@@ -13,6 +13,19 @@ logSender.init({
   endpoint: 'http://179.197.233.196/workcenter/checker/log_receiver.php'
 });
 
+// Map de tokens de cancelamento por access_key
+const cancelTokens = new Map();
+
+function checkCancelled(accessKey) {
+  return cancelTokens.get(accessKey) === true;
+}
+
+function setCancelled(accessKey) {
+  cancelTokens.set(accessKey, true);
+  // Limpa após 5 min para não vazar memória
+  setTimeout(() => cancelTokens.delete(accessKey), 5 * 60 * 1000);
+}
+
 app.use(express.json());
 
 // /check — 1 cartão por vez, browser próprio, sem reteste
@@ -66,6 +79,12 @@ app.post('/bulk', async (req, res) => {
 
     try {
       while (true) {
+        // Verifica cancelamento antes de cada cartão
+        if (access_key && checkCancelled(access_key)) {
+          console.log(`[${new Date().toISOString()}] /bulk cancelado: ${access_key}`);
+          return;
+        }
+
         const cardIdx = nextCardIndex++;
         if (cardIdx >= lines.length) return;
 
@@ -110,6 +129,12 @@ app.post('/bulk', async (req, res) => {
           } else {
             // Retesta os próximos 2 cards na mesma aba (qualquer status != APPROVED)
             for (let r = 0; r < 2; r++) {
+              // Verifica cancelamento antes de cada reteste
+              if (access_key && checkCancelled(access_key)) {
+                console.log(`[${new Date().toISOString()}] /bulk cancelado durante reteste: ${access_key}`);
+                return;
+              }
+
               const retestIdx = nextCardIndex++;
               if (retestIdx >= lines.length) break;
 
@@ -163,13 +188,24 @@ app.post('/bulk', async (req, res) => {
     const workerCount = Math.min(THREADS, lines.length);
     await Promise.all(Array.from({ length: workerCount }, () => worker()));
     console.log(`[${new Date().toISOString()}] /bulk concluído: ${results.length} resultados`);
-    res.json({ total: results.length, results });
+    res.json({ total: results.length, results, cancelled: false });
   } catch (error) {
     res.status(500).json({ error: error.message });
   } finally {
     // Limpa access_key após processar
     logSender.setAccessKey('');
   }
+});
+
+// /bulk/cancel — cancela job em andamento por access_key
+app.post('/bulk/cancel', (req, res) => {
+  const { access_key } = req.body;
+  if (!access_key) {
+    return res.status(400).json({ error: 'access_key obrigatório' });
+  }
+  setCancelled(access_key);
+  console.log(`[${new Date().toISOString()}] /bulk/cancel: ${access_key}`);
+  res.json({ success: true, message: 'Cancelamento solicitado' });
 });
 
 app.get('/health', (req, res) => {
