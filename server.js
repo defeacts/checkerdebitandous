@@ -98,13 +98,22 @@ app.post('/bulk', async (req, res) => {
 
           console.log(`[${new Date().toISOString()}] ${cardNumber} - ${status}`);
 
+          // Considera DECLINED/REPROVADA/Suspected fraud/etc como declínio para reteste
+          const isDeclined = status && (
+            status === 'DECLINED' ||
+            status.includes('DECLINED') ||
+            status.includes('REPROVADA') ||
+            status.includes('fraud') ||
+            status.includes('Fraud')
+          );
+
           if (isTimeout || status === 'APPROVED') {
             if (currentBrowser) {
               try { await currentBrowser.close(); } catch (e) {}
               currentBrowser = null;
               currentPage = null;
             }
-          } else if (status === 'DECLINED' || status === 'ERROR') {
+          } else if (isDeclined || status === 'ERROR') {
             // Retesta os próximos 2 cards na mesma aba
             for (let r = 0; r < 2; r++) {
               const retestIdx = nextCardIndex++;
