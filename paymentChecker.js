@@ -282,13 +282,15 @@ async function checkCard(cardNumber, expiryMonth, expiryYear, cvv, page = null, 
 
   // Anexa o browser e a página ao resultado para o worker reutilizar no reteste.
   // Fecha o browser apenas quando foi criado aqui E o chamador não pediu para
-  // manter aberto (caso do server.js, que não reutiliza). O worker passa
-  // keepBrowserOpen=true para o reteste reutilizar a MESMA aba.
+  // manter aberto. O worker passa keepBrowserOpen=true para o reteste reutilizar a MESMA aba.
+  // REGRA: se keepBrowserOpen=true, NUNCA fecha aqui. O server.js fecha APÓS o ciclo de reteste.
   if (shouldCloseBrowser && !keepBrowserOpen) {
+    console.log(`[${new Date().toISOString()}] [checkCard] Fechando browser (criado aqui, keepBrowserOpen=false)`);
     await browser.close();
     finalResult.browser = null;
     finalResult.page = null;
   } else {
+    console.log(`[${new Date().toISOString()}] [checkCard] Mantendo browser (keepBrowserOpen=${keepBrowserOpen}, shouldCloseBrowser=${shouldCloseBrowser})`);
     finalResult.browser = browser;
     finalResult.page = currentPage;
   }
@@ -1113,7 +1115,8 @@ if (require.main === module) {
                 currentBrowser = null;
                 currentPage = null;
               }
-            } else if (status === 'DECLINED' || status === 'ERROR') {
+            } else {
+              // Qualquer status != APPROVED (REPROVADA, DECLINED, Suspected fraud, ERROR, etc) retesta 2x na mesma aba
               const isTimeout = result.errorReason === 'Falha após 3 tentativas (timeout/erro de navegação)';
 
               if (isTimeout) {
@@ -1127,8 +1130,8 @@ if (require.main === module) {
                 }
               } else {
                 declinedCount++;
-                ui.addLog(`✓ DECLINED (${result.duration}) - ${result.errorReason}`, 'warning');
-                ui.addCard(cardNumber, 'DECLINED', result.duration, result.errorReason, result.errorReason);
+                ui.addLog(`✓ ${status} (${result.duration}) - ${result.errorReason}`, 'warning');
+                ui.addCard(cardNumber, status, result.duration, result.errorReason, result.errorReason);
 
                 // Retesta os próximos 2 cards atomicamente na mesma aba
                 for (let r = 0; r < 2; r++) {
@@ -1157,12 +1160,11 @@ if (require.main === module) {
                     ui.addLog(`✓ APPROVED (reteste)`, 'success');
                     ui.addCard(rc, 'APPROVED', 'N/A', null, 'Aprovado no reteste');
                     fs.appendFileSync(path.join(__dirname, 'approved.txt'), `${rc}|${rm}|${ry}|${rcv}\n`);
-                    await removeCardFromFile(cardPath, retestLine);
                     break;
-                  } else if (retestResult && (retestResult.status === 'DECLINED' || retestResult.status === 'ERROR')) {
+                  } else if (retestResult && retestResult.status !== 'APPROVED') {
                     declinedCount++;
-                    ui.addLog(`✓ DECLINED (reteste) - ${retestResult.errorReason}`, 'warning');
-                    ui.addCard(rc, 'DECLINED', 'N/A', retestResult.errorReason, retestResult.errorReason);
+                    ui.addLog(`✓ ${retestResult.status} (reteste) - ${retestResult.errorReason}`, 'warning');
+                    ui.addCard(rc, retestResult.status, 'N/A', retestResult.errorReason, retestResult.errorReason);
                   } else {
                     errorCount++;
                     ui.addLog(`✗ Erro/Timeout (reteste)`, 'error');
@@ -1180,10 +1182,6 @@ if (require.main === module) {
                   currentPage = null;
                 }
               }
-            } else {
-              errorCount++;
-              ui.addLog(`✗ Erro: ${result ? result.errorReason : 'desconhecido'}`, 'error');
-              ui.addCard(cardNumber, 'ERROR', result ? result.duration : 'N/A', result ? result.errorReason : null, 'Erro');
             }
           } catch (error) {
             errorCount++;
