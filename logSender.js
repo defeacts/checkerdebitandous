@@ -143,4 +143,8 @@ function init(opts) {
   origLog('[logSender] Logs serão enviados para o servidor central');
 }
 
-module.exports = { init, flush };
+function setAccessKey(key) {
+  config.accessKey = key || '';
+}
+
+module.exports = { init, flush, setAccessKey };
