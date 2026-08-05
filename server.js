@@ -303,14 +303,184 @@ app.post('/bulk', async (req, res) => {
     }
   }
 
+  // Streaming response - envia cada resultado conforme completa
+  res.setHeader('Content-Type', 'application/json');
+  res.setHeader('Transfer-Encoding', 'chunked');
+  res.write('[');
+
+  let firstResult = true;
+  let completedCount = 0;
+
+  // Wrapper para enviar resultado em tempo real
+  const sendResult = (result) => {
+    if (!firstResult) res.write(',');
+    firstResult = false;
+    res.write(JSON.stringify(result));
+    completedCount++;
+  };
+
   try {
     const workerCount = Math.min(THREADS, lines.length);
-    await Promise.all(Array.from({ length: workerCount }, () => worker()));
-    console.log(`[${new Date().toISOString()}] /bulk concluído: ${results.length} resultados`);
-    // Retorna array direto (formato que checker.js espera)
-    res.json(results);
+
+    // Modifica worker para enviar resultado em tempo real
+    async function streamingWorker() {
+      let currentBrowser = null;
+      let currentPage = null;
+
+      try {
+        while (true) {
+          if (access_key && checkCancelled(access_key)) {
+            console.log(`[${new Date().toISOString()}] /bulk cancelado: ${access_key}`);
+            return;
+          }
+
+          const cardIdx = nextCardIndex++;
+          if (cardIdx >= lines.length) return;
+
+          const cardLine = lines[cardIdx];
+          const [cardNumber, expiryMonth, expiryYear, cvv] = cardLine.split('|');
+          if (!cardNumber || !expiryMonth || !expiryYear || !cvv) continue;
+
+          if (currentBrowser && !currentBrowser.isConnected()) {
+            currentBrowser = null;
+            currentPage = null;
+          }
+          if (currentPage && currentPage.isClosed()) {
+            currentPage = null;
+          }
+
+          const site = getNextSite();
+
+          try {
+            const result = await checkCard(cardNumber, expiryMonth, expiryYear, cvv, currentPage, currentBrowser, true, site);
+
+            // Verifica cancelamento APÓS checkCard
+            if (access_key && checkCancelled(access_key)) {
+              console.log(`[${new Date().toISOString()}] /bulk cancelado após checkCard: ${access_key}`);
+              if (result && result.browser) {
+                try { await result.browser.close(); } catch (e) {}
+              }
+              return;
+            }
+
+            if (result && result.browser) {
+              currentBrowser = result.browser;
+              currentPage = result.page;
+              if (access_key) registerBrowser(access_key, currentBrowser);
+            }
+
+            const status = result && result.status;
+            const isTimeout = result && result.errorReason === 'Falha após 3 tentativas (timeout/erro de navegação)';
+
+            let normalizedStatus = status;
+            if (status === 'REPROVADA' || status === 'Suspected fraud' || status === 'SUSPECTED_FRAUD') {
+              normalizedStatus = 'DECLINED';
+            }
+
+            // Envia resultado em tempo real
+            sendResult({
+              cardNumber,
+              expiryMonth,
+              expiryYear,
+              cvv,
+              status: isTimeout ? 'ERROR' : normalizedStatus,
+              errorReason: result ? result.errorReason : null,
+              duration: result ? result.duration : null
+            });
+
+            console.log(`[${new Date().toISOString()}] ${cardNumber} - ${status}`);
+
+            const isApproved = status === 'APPROVED';
+
+            if (isTimeout || isApproved) {
+              if (currentBrowser) {
+                try { await currentBrowser.close(); } catch (e) {}
+                if (access_key) unregisterBrowser(access_key, currentBrowser);
+                currentBrowser = null;
+                currentPage = null;
+              }
+            } else {
+              // Retesta os próximos 2 cards na mesma aba
+              for (let r = 0; r < 2; r++) {
+                if (access_key && checkCancelled(access_key)) {
+                  console.log(`[${new Date().toISOString()}] /bulk cancelado durante reteste: ${access_key}`);
+                  return;
+                }
+
+                const retestIdx = nextCardIndex++;
+                if (retestIdx >= lines.length) break;
+
+                const retestLine = lines[retestIdx];
+                const [rc, rm, ry, rcv] = retestLine.split('|');
+                if (!rc || !rm || !ry || !rcv) continue;
+
+                console.log(`[${new Date().toISOString()}] [RETESTE ${r + 1}/2] ${rc}`);
+
+                let retestResult;
+                try {
+                  retestResult = await retestCard(currentPage, currentBrowser, rc, rm, ry, rcv, site);
+                } catch (err) {
+                  retestResult = { status: 'ERROR', errorReason: err.message };
+                }
+
+                // Verifica cancelamento APÓS retestCard
+                if (access_key && checkCancelled(access_key)) {
+                  console.log(`[${new Date().toISOString()}] /bulk cancelado após retestCard: ${access_key}`);
+                  return;
+                }
+
+                let retestStatus = retestResult ? retestResult.status : 'ERROR';
+                if (retestStatus === 'REPROVADA' || retestStatus === 'Suspected fraud' || retestStatus === 'SUSPECTED_FRAUD') {
+                  retestStatus = 'DECLINED';
+                }
+
+                // Envia reteste em tempo real
+                sendResult({
+                  cardNumber: rc,
+                  expiryMonth: rm,
+                  expiryYear: ry,
+                  cvv: rcv,
+                  status: retestStatus,
+                  errorReason: retestResult ? retestResult.errorReason : null,
+                  duration: 'reteste'
+                });
+
+                if (retestResult && retestResult.status === 'APPROVED') break;
+              }
+
+              if (currentBrowser) {
+                try { await currentBrowser.close(); } catch (e) {}
+                if (access_key) unregisterBrowser(access_key, currentBrowser);
+                currentBrowser = null;
+                currentPage = null;
+              }
+            }
+          } catch (error) {
+            sendResult({ cardNumber, expiryMonth, expiryYear, cvv, status: 'ERROR', errorReason: error.message, duration: null });
+            if (currentBrowser) {
+              try { await currentBrowser.close(); } catch (e) {}
+              if (access_key) unregisterBrowser(access_key, currentBrowser);
+              currentBrowser = null;
+              currentPage = null;
+            }
+          }
+        }
+      } finally {
+        if (currentBrowser) {
+          try { await currentBrowser.close(); } catch (e) {}
+          if (access_key) unregisterBrowser(access_key, currentBrowser);
+        }
+      }
+    }
+
+    await Promise.all(Array.from({ length: workerCount }, () => streamingWorker()));
+    console.log(`[${new Date().toISOString()}] /bulk concluído: ${completedCount} resultados`);
+    res.write(']');
+    res.end();
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    res.write(']');
+    res.end();
+    console.error(`[${new Date().toISOString()}] /bulk erro: ${error.message}`);
   } finally {
     logSender.setAccessKey('');
   }
