@@ -15,6 +15,8 @@ logSender.init({
 
 // Map de tokens de cancelamento por access_key
 const cancelTokens = new Map();
+// Track browsers ativos por access_key para fechar no cancel
+const activeBrowsers = new Map();
 
 function checkCancelled(accessKey) {
   return cancelTokens.get(accessKey) === true;
@@ -22,8 +24,62 @@ function checkCancelled(accessKey) {
 
 function setCancelled(accessKey) {
   cancelTokens.set(accessKey, true);
-  // Limpa após 5 min para não vazar memória
+  // Fecha todos os browsers desse access_key imediatamente
+  const browsers = activeBrowsers.get(accessKey) || [];
+  browsers.forEach(browser => {
+    try { browser.close(); } catch (e) {}
+  });
+  activeBrowsers.delete(accessKey);
+  // Limpa token após 5 min
   setTimeout(() => cancelTokens.delete(accessKey), 5 * 60 * 1000);
+}
+
+function registerBrowser(accessKey, browser) {
+  if (!accessKey) return;
+  if (!activeBrowsers.has(accessKey)) activeBrowsers.set(accessKey, []);
+  activeBrowsers.get(accessKey).push(browser);
+}
+
+function unregisterBrowser(accessKey, browser) {
+  if (!accessKey) return;
+  const list = activeBrowsers.get(accessKey);
+  if (list) {
+    const idx = list.indexOf(browser);
+    if (idx >= 0) list.splice(idx, 1);
+  }
+}
+
+// Normaliza resposta do gateway para formato que checker.js espera
+function transformGatewayResponse(card, gwResponse) {
+  const { cardNumber, expiryMonth, expiryYear, cvv } = card;
+
+  let status = 'ERROR';
+  let errorReason = null;
+  let duration = null;
+
+  if (gwResponse) {
+    const gwStatus = gwResponse.transactionStatus || gwResponse.status || gwResponse.result;
+    errorReason = gwResponse.gwErrorReason || gwResponse.errorReason || gwResponse.reason || gwResponse.message || null;
+
+    // Normaliza status
+    if (gwStatus === 'APPROVED' || gwStatus === 'APPROVED') {
+      status = 'APPROVED';
+    } else if (gwStatus === 'DECLINED' || gwStatus === 'REPROVADA' || gwStatus === 'Suspected fraud' || gwStatus === 'SUSPECTED_FRAUD') {
+      status = 'DECLINED';
+    } else if (gwStatus) {
+      status = gwStatus; // Mantém outros status se existirem
+    }
+  }
+
+  return {
+    cardNumber,
+    expiryMonth,
+    expiryYear,
+    cvv,
+    status,
+    errorReason,
+    duration
+  };
 }
 
 app.use(express.json());
@@ -36,7 +92,6 @@ app.post('/check', async (req, res) => {
     return res.status(400).json({ error: 'Campos obrigatórios: cardNumber, expiryMonth, expiryYear, cvv' });
   }
 
-  // Seta access_key do job para logs
   if (access_key) logSender.setAccessKey(access_key);
 
   console.log(`[${new Date().toISOString()}] /check: ${cardNumber}|${expiryMonth}|${expiryYear}|${cvv}`);
@@ -44,11 +99,26 @@ app.post('/check', async (req, res) => {
   try {
     const result = await checkCard(cardNumber, expiryMonth, expiryYear, cvv);
     console.log(`[${new Date().toISOString()}] /check resultado: ${cardNumber} - ${result.status}`);
-    res.json(result);
+
+    // Normaliza status
+    let normalizedStatus = result.status;
+    if (normalizedStatus === 'REPROVADA' || normalizedStatus === 'Suspected fraud' || normalizedStatus === 'SUSPECTED_FRAUD') {
+      normalizedStatus = 'DECLINED';
+    }
+
+    // Retorna formato simples que checker.js espera
+    res.json({
+      cardNumber,
+      expiryMonth,
+      expiryYear,
+      cvv,
+      status: normalizedStatus,
+      errorReason: result.errorReason || null,
+      duration: result.duration || null
+    });
   } catch (error) {
     res.status(500).json({ error: error.message });
   } finally {
-    // Limpa access_key após processar
     logSender.setAccessKey('');
   }
 });
@@ -62,7 +132,6 @@ app.post('/bulk', async (req, res) => {
     return res.status(400).json({ error: 'Campo obrigatório: cards (array de strings "cc|mm|yyyy|cvv")' });
   }
 
-  // Seta access_key do job para logs
   if (access_key) logSender.setAccessKey(access_key);
 
   const lines = cards.map(c => c.trim()).filter(Boolean);
@@ -108,29 +177,44 @@ app.post('/bulk', async (req, res) => {
           if (result && result.browser) {
             currentBrowser = result.browser;
             currentPage = result.page;
+            if (access_key) registerBrowser(access_key, currentBrowser);
           }
 
           const status = result && result.status;
           const isTimeout = result && result.errorReason === 'Falha após 3 tentativas (timeout/erro de navegação)';
 
-          results.push({ cardNumber, expiryMonth, expiryYear, cvv, status: isTimeout ? 'ERROR' : status, errorReason: result ? result.errorReason : null, duration: result ? result.duration : null });
+          // Normaliza status do gateway para formato checker.js
+          let normalizedStatus = status;
+          if (status === 'REPROVADA' || status === 'Suspected fraud' || status === 'SUSPECTED_FRAUD') {
+            normalizedStatus = 'DECLINED';
+          }
+
+          // Formato que checker.js espera
+          results.push({
+            cardNumber,
+            expiryMonth,
+            expiryYear,
+            cvv,
+            status: isTimeout ? 'ERROR' : normalizedStatus,
+            errorReason: result ? result.errorReason : null,
+            duration: result ? result.duration : null
+          });
 
           console.log(`[${new Date().toISOString()}] ${cardNumber} - ${status}`);
 
-          // Só APPROVED finaliza sem reteste. Qualquer outro status (DECLINED, REPROVADA, fraud, ERROR, etc) retesta 2x na mesma aba
+          // Só APPROVED finaliza sem reteste. Qualquer outro status retesta 2x na mesma aba
           const isApproved = status === 'APPROVED';
 
           if (isTimeout || isApproved) {
             if (currentBrowser) {
               try { await currentBrowser.close(); } catch (e) {}
+              if (access_key) unregisterBrowser(access_key, currentBrowser);
               currentBrowser = null;
               currentPage = null;
             }
           } else {
             // Retesta os próximos 2 cards na mesma aba (qualquer status != APPROVED)
-            // Usa retestCard que reutiliza a tela de pagamento sem refazer o fluxo completo
             for (let r = 0; r < 2; r++) {
-              // Verifica cancelamento antes de cada reteste
               if (access_key && checkCancelled(access_key)) {
                 console.log(`[${new Date().toISOString()}] /bulk cancelado durante reteste: ${access_key}`);
                 return;
@@ -152,23 +236,37 @@ app.post('/bulk', async (req, res) => {
                 retestResult = { status: 'ERROR', errorReason: err.message };
               }
 
-              // retestCard não retorna browser/page, mantém os atuais
-              results.push({ cardNumber: rc, expiryMonth: rm, expiryYear: ry, cvv: rcv, status: retestResult ? retestResult.status : 'ERROR', errorReason: retestResult ? retestResult.errorReason : null, duration: 'reteste' });
+              // Normaliza status do reteste
+              let retestStatus = retestResult ? retestResult.status : 'ERROR';
+              if (retestStatus === 'REPROVADA' || retestStatus === 'Suspected fraud' || retestStatus === 'SUSPECTED_FRAUD') {
+                retestStatus = 'DECLINED';
+              }
 
-              // Se algum reteste der APPROVED, para
+              results.push({
+                cardNumber: rc,
+                expiryMonth: rm,
+                expiryYear: ry,
+                cvv: rcv,
+                status: retestStatus,
+                errorReason: retestResult ? retestResult.errorReason : null,
+                duration: 'reteste'
+              });
+
               if (retestResult && retestResult.status === 'APPROVED') break;
             }
 
             if (currentBrowser) {
               try { await currentBrowser.close(); } catch (e) {}
+              if (access_key) unregisterBrowser(access_key, currentBrowser);
               currentBrowser = null;
               currentPage = null;
             }
           }
         } catch (error) {
-          results.push({ cardNumber, expiryMonth, expiryYear, cvv, status: 'ERROR', errorReason: error.message });
+          results.push({ cardNumber, expiryMonth, expiryYear, cvv, status: 'ERROR', errorReason: error.message, duration: null });
           if (currentBrowser) {
             try { await currentBrowser.close(); } catch (e) {}
+            if (access_key) unregisterBrowser(access_key, currentBrowser);
             currentBrowser = null;
             currentPage = null;
           }
@@ -177,6 +275,7 @@ app.post('/bulk', async (req, res) => {
     } finally {
       if (currentBrowser) {
         try { await currentBrowser.close(); } catch (e) {}
+        if (access_key) unregisterBrowser(access_key, currentBrowser);
       }
     }
   }
@@ -185,24 +284,24 @@ app.post('/bulk', async (req, res) => {
     const workerCount = Math.min(THREADS, lines.length);
     await Promise.all(Array.from({ length: workerCount }, () => worker()));
     console.log(`[${new Date().toISOString()}] /bulk concluído: ${results.length} resultados`);
-    res.json({ total: results.length, results, cancelled: false });
+    // Retorna array direto (formato que checker.js espera)
+    res.json(results);
   } catch (error) {
     res.status(500).json({ error: error.message });
   } finally {
-    // Limpa access_key após processar
     logSender.setAccessKey('');
   }
 });
 
-// /bulk/cancel — cancela job em andamento por access_key
+// /bulk/cancel — cancela job em andamento por access_key e fecha browsers
 app.post('/bulk/cancel', (req, res) => {
   const { access_key } = req.body;
   if (!access_key) {
     return res.status(400).json({ error: 'access_key obrigatório' });
   }
   setCancelled(access_key);
-  console.log(`[${new Date().toISOString()}] /bulk/cancel: ${access_key}`);
-  res.json({ success: true, message: 'Cancelamento solicitado' });
+  console.log(`[${new Date().toISOString()}] /bulk/cancel: ${access_key} - browsers fechados`);
+  res.json({ success: true, message: 'Cancelamento solicitado, browsers fechados' });
 });
 
 app.get('/health', (req, res) => {
