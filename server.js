@@ -1,5 +1,5 @@
 const express = require('express');
-const { checkCard } = require('./paymentChecker');
+const { checkCard, retestCard } = require('./paymentChecker');
 const { getNextSite } = require('./paymentChecker');
 const logSender = require('./logSender');
 
@@ -128,6 +128,7 @@ app.post('/bulk', async (req, res) => {
             }
           } else {
             // Retesta os próximos 2 cards na mesma aba (qualquer status != APPROVED)
+            // Usa retestCard que reutiliza a tela de pagamento sem refazer o fluxo completo
             for (let r = 0; r < 2; r++) {
               // Verifica cancelamento antes de cada reteste
               if (access_key && checkCancelled(access_key)) {
@@ -146,16 +147,12 @@ app.post('/bulk', async (req, res) => {
 
               let retestResult;
               try {
-                retestResult = await checkCard(rc, rm, ry, rcv, currentPage, currentBrowser, true, site);
+                retestResult = await retestCard(currentPage, currentBrowser, rc, rm, ry, rcv, site);
               } catch (err) {
                 retestResult = { status: 'ERROR', errorReason: err.message };
               }
 
-              if (retestResult && retestResult.browser) {
-                currentBrowser = retestResult.browser;
-                currentPage = retestResult.page;
-              }
-
+              // retestCard não retorna browser/page, mantém os atuais
               results.push({ cardNumber: rc, expiryMonth: rm, expiryYear: ry, cvv: rcv, status: retestResult ? retestResult.status : 'ERROR', errorReason: retestResult ? retestResult.errorReason : null, duration: 'reteste' });
 
               // Se algum reteste der APPROVED, para
