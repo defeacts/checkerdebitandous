@@ -27,7 +27,15 @@ function setCancelled(accessKey) {
   // Fecha todos os browsers desse access_key imediatamente
   const browsers = activeBrowsers.get(accessKey) || [];
   browsers.forEach(browser => {
-    try { browser.close(); } catch (e) {}
+    try {
+      browser.close();
+    } catch (e) {}
+    // Force kill se não fechar
+    try {
+      if (browser.process && browser.process().kill) {
+        browser.process().kill('SIGKILL');
+      }
+    } catch (e) {}
   });
   activeBrowsers.delete(accessKey);
   // Limpa token após 5 min
@@ -174,6 +182,15 @@ app.post('/bulk', async (req, res) => {
         try {
           const result = await checkCard(cardNumber, expiryMonth, expiryYear, cvv, currentPage, currentBrowser, true, site);
 
+          // Verifica cancelamento APÓS checkCard (pode demorar 30-60s)
+          if (access_key && checkCancelled(access_key)) {
+            console.log(`[${new Date().toISOString()}] /bulk cancelado após checkCard: ${access_key}`);
+            if (result && result.browser) {
+              try { await result.browser.close(); } catch (e) {}
+            }
+            return;
+          }
+
           if (result && result.browser) {
             currentBrowser = result.browser;
             currentPage = result.page;
@@ -234,6 +251,12 @@ app.post('/bulk', async (req, res) => {
                 retestResult = await retestCard(currentPage, currentBrowser, rc, rm, ry, rcv, site);
               } catch (err) {
                 retestResult = { status: 'ERROR', errorReason: err.message };
+              }
+
+              // Verifica cancelamento APÓS retestCard
+              if (access_key && checkCancelled(access_key)) {
+                console.log(`[${new Date().toISOString()}] /bulk cancelado após retestCard: ${access_key}`);
+                return;
               }
 
               // Normaliza status do reteste
